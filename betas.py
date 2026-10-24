@@ -1,4 +1,5 @@
 import json
+import statistics
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -28,11 +29,16 @@ def day(ts):
 
 
 def yahoo(ticker):
+    # explicit start date (2017-01-01) so Yahoo returns weekly bars, not monthly
     j = get("https://query1.finance.yahoo.com/v8/finance/chart/" + ticker
-            + "?interval=1wk&range=max")
+            + "?interval=1wk&period1=1483228800&period2=" + str(int(time.time()) + 86400))
     r = j["chart"]["result"][0]
     closes = r["indicators"]["quote"][0]["close"]
-    return {day(t): c for t, c in zip(r["timestamp"], closes) if c}
+    out = {day(t): c for t, c in zip(r["timestamp"], closes) if c}
+    # drop the live, partial current-week bar (weekly bars start on a Monday)
+    if out and datetime.strptime(max(out), "%Y-%m-%d").weekday() != 0:
+        del out[max(out)]
+    return out
 
 
 def kraken(pair):
@@ -64,7 +70,9 @@ if __name__ == "__main__":
         try:
             src, w = weekly_closes(sym)
             d = sorted(w)
-            print(f"{sym} [{src}]: {len(d)} weeks, {d[0]} to {d[-1]}, last close {w[d[-1]]:,.4g}")
+            dt = [datetime.strptime(x, "%Y-%m-%d") for x in d]
+            gap = statistics.median([(b - a).days for a, b in zip(dt, dt[1:])])
+            print(f"{sym} [{src}]: {len(d)} weeks, {d[0]} to {d[-1]}, gap {gap:.0f}d, last full-week close {w[d[-1]]:,.4g}")
         except Exception as e:
             print(f"{sym}: FAILED ({e})")
         time.sleep(1)

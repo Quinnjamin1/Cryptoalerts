@@ -1,21 +1,23 @@
 import json
+import os
 import statistics
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
-# coin: (Yahoo ticker, Kraken pair or None)
-COINS = {
-    "BTC": ("BTC-USD", "XBTUSD"),
-    "ETH": ("ETH-USD", "ETHUSD"),
-    "SOL": ("SOL-USD", "SOLUSD"),
-    "ZEC": ("ZEC-USD", "ZECUSD"),
-    "BNB": ("BNB-USD", None),
-    "XRP": ("XRP-USD", "XRPUSD"),
-    "NEAR": ("NEAR-USD", "NEARUSD"),
-    "HYPE": ("HYPE32196-USD", "HYPEUSD"),
-    "DOGE": ("DOGE-USD", "XDGUSD"),
+TICKERS = {
+    "BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD", "ZEC": "ZEC-USD",
+    "BNB": "BNB-USD", "XRP": "XRP-USD", "NEAR": "NEAR-USD",
+    "HYPE": "HYPE32196-USD", "DOGE": "DOGE-USD",
 }
+DIP = float(os.environ.get("DIP", "3"))  # a "dip week" = BTC down at least this %
+
+# 4-year cycles, split at the halvings (inclusive dates of the week-ending Sunday)
+CYCLES = [
+    ("C1 2017-20", "2017-01-01", "2020-05-10"),
+    ("C2 2020-24", "2020-05-11", "2024-04-19"),
+    ("C3 2024-now", "2024-04-20", "2099-01-01"),
+]
 
 
 def get(url):
@@ -24,55 +26,63 @@ def get(url):
         return json.load(r)
 
 
-def day(ts):
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
-
-
-def yahoo(ticker):
-    # explicit start date (2017-01-01) so Yahoo returns weekly bars, not monthly
+def sunday_closes(ticker):
+    """Daily history -> the Sunday close (UTC) of every completed week."""
     j = get("https://query1.finance.yahoo.com/v8/finance/chart/" + ticker
-            + "?interval=1wk&period1=1483228800&period2=" + str(int(time.time()) + 86400))
+            + "?interval=1d&period1=1483228800&period2=" + str(int(time.time()) + 86400))
     r = j["chart"]["result"][0]
     closes = r["indicators"]["quote"][0]["close"]
-    out = {day(t): c for t, c in zip(r["timestamp"], closes) if c}
-    # drop the live, partial current-week bar (weekly bars start on a Monday)
-    if out and datetime.strptime(max(out), "%Y-%m-%d").weekday() != 0:
-        del out[max(out)]
+    today = datetime.now(timezone.utc).date()
+    out = {}
+    for t, c in zip(r["timestamp"], closes):
+        if not c:
+            continue
+        d = datetime.fromtimestamp(t, tz=timezone.utc).date()
+        if d.weekday() == 6 and d < today:
+            out[d.isoformat()] = c
     return out
 
 
-def kraken(pair):
-    j = get("https://api.kraken.com/0/public/OHLC?pair=" + pair + "&interval=10080")
-    if j.get("error"):
-        raise Exception(j["error"])
-    rows = [v for k, v in j["result"].items() if k != "last"][0]
-    return {day(r[0]): float(r[4]) for r in rows if float(r[4]) > 0}
-
-
-def weekly_closes(sym):
-    y, k = COINS[sym]
-    errors = []
-    for name, fn, arg in (("yahoo", yahoo, y), ("kraken", kraken, k)):
-        if not arg:
-            continue
-        try:
-            w = fn(arg)
-            if len(w) > 10:
-                return name, w
-            errors.append(f"{name}: too little data")
-        except Exception as e:
-            errors.append(f"{name}: {e}")
-    raise Exception("; ".join(errors))
+def weekly_returns(closes):
+    out = {}
+    for d, c in closes.items():
+        prev = (date.fromisoformat(d) - timedelta(days=7)).isoformat()
+        if prev in closes:
+            out[d] = c / closes[prev] - 1
+    return out
 
 
 if __name__ == "__main__":
-    for sym in COINS:
+    rets = {}
+    for sym, tick in TICKERS.items():
         try:
-            src, w = weekly_closes(sym)
-            d = sorted(w)
-            dt = [datetime.strptime(x, "%Y-%m-%d") for x in d]
-            gap = statistics.median([(b - a).days for a, b in zip(dt, dt[1:])])
-            print(f"{sym} [{src}]: {len(d)} weeks, {d[0]} to {d[-1]}, gap {gap:.0f}d, last full-week close {w[d[-1]]:,.4g}")
+            rets[sym] = weekly_returns(sunday_closes(tick))
+            d = sorted(rets[sym])
+            print(f"{sym}: {len(d)} weekly returns, {d[0]} to {d[-1]}")
         except Exception as e:
             print(f"{sym}: FAILED ({e})")
         time.sleep(1)
+
+    btc = rets["BTC"]
+    dips = {d: r for d, r in btc.items() if r <= -DIP / 100}
+
+    print(f"\nBTC weeks down {DIP:g}% or more, by cycle:")
+    for name, a, b in CYCLES:
+        ds = [d for d in dips if a <= d <= b]
+        total = [d for d in btc if a <= d <= b]
+        if ds:
+            avg = statistics.mean(dips[d] for d in ds)
+            worst = min(dips[d] for d in ds)
+            print(f"{name}: {len(ds)} dip weeks of {len(total)}, avg {avg:.1%}, worst {worst:.1%}")
+        else:
+            print(f"{name}: none")
+
+    print("\nDip weeks each coin has data for:")
+    for sym in rets:
+        if sym == "BTC":
+            continue
+        parts = []
+        for name, a, b in CYCLES:
+            n = sum(1 for d in dips if a <= d <= b and d in rets[sym])
+            parts.append(f"{name.split()[0]}: {n}")
+        print(sym, " | ".join(parts))
